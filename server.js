@@ -13,7 +13,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 // Google Sheets Setup
 const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT),
+  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || '{}'),
   scopes: ['https://www.googleapis.com/auth/spreadsheets']
 });
 const sheets = google.sheets({ version: 'v4', auth });
@@ -34,30 +34,35 @@ const generateCode = () => {
   return Array.from({ length: 3 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
 };
 
+// Root route (for testing)
+app.get('/', (req, res) => {
+  res.send('Premier Pass backend is running!');
+});
+
+// Health route
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
 // Sign-in endpoint
 app.post('/signin', async (req, res) => {
   const { studentId } = req.body;
-
   const code = generateCode();
-  const { data, error } = await supabase.from('attendance_logs').insert([
-    {
-      student_id: studentId,
-      code,
-      action: 'sign_in',
-      timestamp: new Date()
-    }
+
+  const { error } = await supabase.from('attendance_logs').insert([
+    { student_id: studentId, code, action: 'sign_in', timestamp: new Date() }
   ]);
 
   if (error) return res.status(500).json({ error: error.message });
 
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: 'Logs!A:E',
-    valueInputOption: 'RAW',
-    requestBody: {
-      values: [[new Date().toLocaleString(), studentId, 'Sign In', code, '']]
-    }
-  });
+  if (SPREADSHEET_ID) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Logs!A:E',
+      valueInputOption: 'RAW',
+      requestBody: { values: [[new Date().toLocaleString(), studentId, 'Sign In', code, '']] }
+    });
+  }
 
   res.json({ message: 'Signed in', code });
 });
@@ -66,24 +71,20 @@ app.post('/signin', async (req, res) => {
 app.post('/signout', async (req, res) => {
   const { studentId } = req.body;
 
-  const { data, error } = await supabase.from('attendance_logs').insert([
-    {
-      student_id: studentId,
-      action: 'sign_out',
-      timestamp: new Date()
-    }
+  const { error } = await supabase.from('attendance_logs').insert([
+    { student_id: studentId, action: 'sign_out', timestamp: new Date() }
   ]);
 
   if (error) return res.status(500).json({ error: error.message });
 
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: 'Logs!A:E',
-    valueInputOption: 'RAW',
-    requestBody: {
-      values: [[new Date().toLocaleString(), studentId, 'Sign Out', '', '']]
-    }
-  });
+  if (SPREADSHEET_ID) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Logs!A:E',
+      valueInputOption: 'RAW',
+      requestBody: { values: [[new Date().toLocaleString(), studentId, 'Sign Out', '', '']] }
+    });
+  }
 
   res.json({ message: 'Signed out' });
 });
@@ -95,12 +96,7 @@ app.post('/override', async (req, res) => {
   if (adminKey !== process.env.ADMIN_KEY) return res.status(403).json({ error: 'Unauthorized' });
 
   const { error } = await supabase.from('attendance_logs').insert([
-    {
-      student_id: studentId,
-      action,
-      timestamp: new Date(),
-      override: true
-    }
+    { student_id: studentId, action, timestamp: new Date(), override: true }
   ]);
 
   if (error) return res.status(500).json({ error: error.message });
@@ -108,7 +104,39 @@ app.post('/override', async (req, res) => {
   res.json({ message: `Override successful: ${action}` });
 });
 
-// Auto sign-out at noon and 2 PM
+// Auto sign-out at noon
 cron.schedule('0 12 * * *', async () => {
   const { data: students } = await supabase.from('students').select('*').eq('leave_time', '12:00');
-  for (
+  for (const student of students || []) {
+    await supabase.from('attendance_logs').insert([{ student_id: student.id, action: 'auto_sign_out', timestamp: new Date() }]);
+  }
+});
+
+// Auto sign-out at 2 PM
+cron.schedule('0 14 * * *', async () => {
+  const { data: students } = await supabase.from('students').select('*').eq('leave_time', '14:00');
+  for (const student of students || []) {
+    await supabase.from('attendance_logs').insert([{ student_id: student.id, action: 'auto_sign_out', timestamp: new Date() }]);
+  }
+});
+
+// Daily email logs to admins
+cron.schedule('0 18 * * *', async () => {
+  const todayStart = new Date();
+  todayStart.setHours(6, 0, 0, 0);
+
+  const { data } = await supabase.from('attendance_logs').select('*').gte('timestamp', todayStart);
+
+  if (data) {
+    await transporter.sendMail({
+      from: process.env.ADMIN_EMAIL,
+      to: process.env.ADMIN_EMAIL,
+      subject: 'Daily Attendance Logs',
+      text: JSON.stringify(data, null, 2)
+    });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Premier Pass backend running on port ${PORT}`));
